@@ -99,7 +99,7 @@ def main():
     # Playwright Automation Start (Sequential Execution)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
-        user_agent_1 = "Mozilla/5.0 (Linux; Android 16; motorola edge 50 fusion Build/W1UUIS36H.110-42-3; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/152.0.7977.72 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/577.0.0.44.72;IABMV/1;]"
+        user_agent_1 = "Mozilla/5.0 (Linux; Android 16; motorola edge 50 fusion Build/W1UUIS36H.110-42-4) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/157.0.8103.31 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/586.0.0.1.53;IABMV/1;]"
         user_agent_2 = "Mozilla/5.0 (Linux; Android 9; SM-A205YN Build/PPR1.180610.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/80.0.3987.99 Mobile Safari/537.36 [FBAN/DiscoverApp;FBAV/2.0.0.0.1266;]"
         
         try:
