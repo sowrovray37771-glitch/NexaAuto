@@ -1,0 +1,1205 @@
+"""NexaBrowser / NexaAura Python Runner: open -> Get Started -> name -> DOB -> gender -> mobile -> password -> Save -> I agree -> SMS -> Continue -> delete used Number entry.
+
+Use this ONLY with NexaBrowser's NexaAura > Python Runner source edition.
+It controls the current WebView2 tab using the included `nexa_browser` SDK;
+it does not open Chrome, Edge, or other browser windows.
+
+Configuration popup always opens with the editable, pre-filled Website URL
+(DEFAULT_WEBSITE_URL) and action wait MIN and MAX in milliseconds (default
+200-500). If Tkinter is unavailable, prompts appear in the Runner's
+terminal; type each response in the Runner's "Send input" box.
+
+For authorized website testing only. This script runs once, does not bypass
+CAPTCHA/challenges, and stops if target fields are ambiguous or missing. It stops after a confirmed verification-code page; it does not read or bypass verification codes.
+
+Extension integration: reads the FIRST Number extension entry and the ONE
+saved Password extension text from encrypted, local Windows CurrentUser DPAPI
+files. Neither value is printed or sent anywhere except the configured page.
+No browser source/bridge modification or pip package is required.
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import os
+from ctypes import wintypes
+from pathlib import Path
+import json
+import random
+import sys
+import time
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+from nexa_browser import NexaAutomationError, NexaBrowser
+
+# ============================================================
+# WEBSITE ADDRESS: Set your preferred site once in this line.
+# Example: DEFAULT_WEBSITE_URL = "https://my-site.example/signup"
+# The URL appears pre-filled in the Settings popup on EVERY run;
+# you can still change it in the popup for just that run.
+# Leave empty to enter a URL manually each time.
+# ============================================================
+DEFAULT_WEBSITE_URL = "https://m.facebook.com/reg/"
+
+# Editable defaults shown in the popup.
+DEFAULT_MIN_ACTION_TIME_MS = 200
+DEFAULT_MAX_ACTION_TIME_MS = 500
+
+# 50 distinctive first names often used or considered gender-flexible.
+# Name usage varies by culture; this is a sample dataset for testing.
+FIRST_NAMES = [
+    "Arden", "Auden", "Aven", "Bellamy", "Briar", "Caelan", "Ciel", "Coda",
+    "Darian", "Ellis", "Emery", "Fallon", "Finley", "Greer", "Hollis",
+    "Indigo", "Jules", "Kestrel", "Kit", "Larkin", "Lennon", "Linden",
+    "Lior", "Marlowe", "Merritt", "Micah", "Milan", "Monroe", "Noa",
+    "Ocean", "Onyx", "Ori", "Palmer", "Pax", "Perrin", "Phoenix",
+    "Quinn", "Reese", "Remy", "Ren", "River", "Rowan", "Sage", "Shiloh",
+    "Sol", "Sorrel", "Tatum", "Vale", "Wren", "Zephyr",
+]
+
+# 50 surnames (surnames are generally not gender-specific).
+SURNAMES = [
+    "Alder", "Ashby", "Aster", "Avery", "Banks", "Beckett", "Bell",
+    "Birch", "Blaine", "Blythe", "Bracken", "Brook", "Calder", "Calloway",
+    "Carr", "Cavanaugh", "Cove", "Ellery", "Ellison", "Fairchild", "Fenwick",
+    "Finch", "Firth", "Foster", "Glass", "Hart", "Harlow", "Hawthorne",
+    "Holling", "Keene", "Kellan", "Lake", "Langley", "Lockwood", "Lowen",
+    "Mercer", "Merriweather", "North", "Oakley", "Peregrine", "Quill",
+    "Rainier", "Reed", "Sloane", "Sterling", "Vale", "Voss", "Wilder",
+    "Winslow", "Yarrow",
+]
+
+GET_STARTED_TIMEOUT = 45.0
+FORM_TIMEOUT = 45.0
+MAX_ACTION_DELAY_MS = 3_600_000  # guard against accidental very long waits (1h)
+
+
+class Cancelled(Exception):
+    """User closed or cancelled the configuration form."""
+
+
+@dataclass(frozen=True)
+class Settings:
+    url: str
+    minimum_ms: int = 200
+    maximum_ms: int = 500
+
+
+def check_url(raw: str) -> str:
+    value = raw.strip()
+    if not value or any(char.isspace() for char in value):
+        raise ValueError("Enter a website address without spaces.")
+    if "://" not in value:
+        value = "https://" + value
+    parts = urlsplit(value)
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        raise ValueError("Only valid http:// or https:// URLs are supported.")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("Usernames/passwords embedded in URLs are not supported.")
+    try:
+        _ = parts.port
+    except ValueError as exc:
+        raise ValueError("Invalid port in URL.") from exc
+    return value
+
+
+def check_settings(url: str, minimum_ms: str | int, maximum_ms: str | int) -> Settings:
+    try:
+        minimum = int(str(minimum_ms).strip())
+        maximum = int(str(maximum_ms).strip())
+    except ValueError as exc:
+        raise ValueError("Action Time values must be whole numbers (milliseconds).") from exc
+    if minimum < 0 or maximum < minimum:
+        raise ValueError("Action Time requires 0 <= Minimum <= Maximum.")
+    if maximum > MAX_ACTION_DELAY_MS:
+        raise ValueError("Maximum Action Time cannot exceed 3,600,000 ms (1 hour).")
+    return Settings(check_url(url), minimum, maximum)
+
+
+def settings_popup(default_url: str, default_min_ms: str, default_max_ms: str) -> Settings:
+    """Display one GUI popup for link, min ms, max ms; raise on cancellation."""
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    root = tk.Tk()
+    root.title("NexaBrowser - Python Automation Settings")
+    root.geometry("510x265")
+    root.minsize(450, 265)
+    root.resizable(True, False)
+    root.attributes("-topmost", True)
+    outer = ttk.Frame(root, padding=17)
+    outer.pack(fill="both", expand=True)
+    ttk.Label(outer, text="Website link", font=("Segoe UI", 10, "bold")).grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 4)
+    )
+    link = ttk.Entry(outer)
+    link.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 13))
+    link.insert(0, default_url or "https://")
+    ttk.Label(outer, text="Minimum Action Time (ms)").grid(row=2, column=0, sticky="w", padx=(0, 12))
+    ttk.Label(outer, text="Maximum Action Time (ms)").grid(row=2, column=1, sticky="w")
+    minimum = ttk.Entry(outer)
+    minimum.grid(row=3, column=0, sticky="ew", padx=(0, 12), pady=(4, 7))
+    minimum.insert(0, default_min_ms)
+    maximum = ttk.Entry(outer)
+    maximum.grid(row=3, column=1, sticky="ew", pady=(4, 7))
+    maximum.insert(0, default_max_ms)
+    ttk.Label(outer, text="Every action gets a new random wait in this range.").grid(
+        row=4, column=0, columnspan=2, sticky="w", pady=(0, 15)
+    )
+    outer.columnconfigure(0, weight=1)
+    outer.columnconfigure(1, weight=1)
+    result: list[Settings] = []
+
+    def cancel() -> None:
+        root.destroy()
+
+    def save() -> None:
+        try:
+            config = check_settings(link.get(), minimum.get(), maximum.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid settings", str(exc), parent=root)
+            return
+        result.append(config)
+        root.destroy()
+
+    button_frame = ttk.Frame(outer)
+    button_frame.grid(row=5, column=0, columnspan=2, sticky="e")
+    ttk.Button(button_frame, text="Cancel", command=cancel).pack(side="left", padx=(0, 10))
+    ttk.Button(button_frame, text="Start Automation", command=save).pack(side="left")
+    root.bind("<Return>", lambda _event: save())
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    link.focus_set()
+    root.mainloop()
+    if not result:
+        raise Cancelled("Configuration cancelled.")
+    return result[0]
+
+
+def settings_from_runner_input(default_url: str, default_min_ms: str, default_max_ms: str) -> Settings:
+    """Fallback when Tkinter is unavailable; Enter keeps the code defaults."""
+    print(f"Website link [default: {default_url or '(none)'}] (blank = default):", flush=True)
+    url = input().strip() or default_url
+    print(f"Minimum action time (ms) [default: {default_min_ms}] (blank = default):", flush=True)
+    minimum = input().strip() or default_min_ms
+    print(f"Maximum action time (ms) [default: {default_max_ms}] (blank = default):", flush=True)
+    maximum = input().strip() or default_max_ms
+    return check_settings(url, minimum, maximum)
+
+
+def get_settings() -> Settings:
+    parser = argparse.ArgumentParser(description="NexaBrowser tab automation")
+    parser.add_argument("url", nargs="?", help="Optional URL to pre-fill in the settings popup")
+    parser.add_argument("--min-ms", default=str(DEFAULT_MIN_ACTION_TIME_MS),
+                        help="Initial minimum action wait in ms")
+    parser.add_argument("--max-ms", default=str(DEFAULT_MAX_ACTION_TIME_MS),
+                        help="Initial maximum action wait in ms")
+    args = parser.parse_args()
+    default_url = args.url or DEFAULT_WEBSITE_URL
+    # Never bypass the popup: URL and action-time values remain editable.
+    try:
+        return settings_popup(default_url, args.min_ms, args.max_ms)
+    except (ImportError, ModuleNotFoundError, OSError, RuntimeError, EOFError) as exc:
+        print("[info] GUI unavailable; using Runner input:", str(exc), flush=True)
+        return settings_from_runner_input(default_url, args.min_ms, args.max_ms)
+
+
+def action_wait(settings: Settings, action: str) -> None:
+    """Fresh independent random delay before each click/fill."""
+    milliseconds = random.randint(settings.minimum_ms, settings.maximum_ms)
+    print(f"[wait] {action}: {milliseconds} ms", flush=True)
+    time.sleep(milliseconds / 1000.0)
+
+
+# A strict visible-button reader. Look in the main document and accessible
+# same-origin iframes; do not mistake the other 'Find my account' button.
+BUTTONS_JS = r"""
+(() => {
+  const wanted = new Set(['get started', 'find my account']);
+  const found = new Set();
+  function scan(doc) {
+    for (const el of doc.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"]')) {
+      const label = String(el.innerText || el.value || el.getAttribute('aria-label') || el.textContent || '')
+        .trim().replace(/\s+/g, ' ').toLowerCase();
+      if (!wanted.has(label) || el.disabled) continue;
+      const rect = el.getBoundingClientRect();
+      const st = doc.defaultView.getComputedStyle(el);
+      if (rect.width > 0 && rect.height > 0 && st.visibility !== 'hidden' && st.display !== 'none') {
+        found.add(label);
+      }
+    }
+    for (const frame of doc.querySelectorAll('iframe')) {
+      try { if (frame.contentDocument) scan(frame.contentDocument); } catch (_) {}
+    }
+  }
+  scan(document);
+  return Array.from(found);
+})()
+"""
+
+
+def wait_for_get_started(browser: NexaBrowser, timeout: float = GET_STARTED_TIMEOUT) -> None:
+    until = time.monotonic() + timeout
+    seen_before: set[str] = set()
+    while time.monotonic() < until:
+        found = browser.evaluate(BUTTONS_JS)
+        names = set(found) if isinstance(found, list) else set()
+        if names != seen_before:
+            if names:
+                print("[buttons] " + ", ".join(sorted(names)), flush=True)
+            seen_before = names
+        if "get started" in names:
+            return
+        time.sleep(0.3)
+    raise TimeoutError("Get Started button not found in 45 seconds (or is inside an inaccessible frame).")
+
+
+# Locate input fields by *exact* normalized accessible labels / placeholders.
+# The bridge's fill() accepts CSS selectors. The target is marked temporarily
+# so generic unnamed inputs can be addressed precisely without guessing order.
+FIELD_JS_TEMPLATE = r"""
+(() => {
+  const role = __ROLE__;
+  const synonyms = role === 'first' ?
+    new Set(['first name', 'firstname', 'given name', 'givenname', 'fname', 'given name(s)']) :
+    new Set(['surname', 'sur name', 'last name', 'lastname', 'family name', 'familyname', 'lname']);
+  const mark = 'data-nexa-py-field';
+  function norm(x) {
+    return String(x || '').toLowerCase().replace(/[_\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  const matches = [];
+  const inputs = document.querySelectorAll('input,textarea');
+  for (const el of inputs) {
+    const type = norm(el.getAttribute('type') || 'text');
+    if (!['text','search',''].includes(type) || el.disabled || el.readOnly) continue;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    if (!rect.width || !rect.height || style.display === 'none' || style.visibility === 'hidden') continue;
+    const labels = [
+      el.getAttribute('placeholder'), el.getAttribute('aria-label'),
+      el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('autocomplete')
+    ];
+    if (el.labels) for (const label of el.labels) labels.push(label.innerText || label.textContent);
+    const labelledby = el.getAttribute('aria-labelledby');
+    if (labelledby) for (const id of labelledby.split(/\s+/)) {
+      const source = document.getElementById(id);
+      if (source) labels.push(source.textContent);
+    }
+    if (labels.some(label => synonyms.has(norm(label)))) matches.push(el);
+  }
+  for (const el of document.querySelectorAll('[' + mark + ']')) {
+    if (el.getAttribute(mark) === role) el.removeAttribute(mark);
+  }
+  if (matches.length !== 1) return {status: matches.length ? 'ambiguous' : 'missing', count: matches.length};
+  const target = matches[0];
+  target.setAttribute(mark, role);
+  return {status: 'ready', count: 1, value: target.value || ''};
+})()
+"""
+
+
+def field_state(browser: NexaBrowser, role: str) -> dict:
+    if role not in ("first", "surname"):
+        raise ValueError("Unknown input role")
+    response = browser.evaluate(FIELD_JS_TEMPLATE.replace("__ROLE__", json.dumps(role)))
+    if not isinstance(response, dict):
+        raise RuntimeError("Unable to inspect website fields")
+    return response
+
+
+def wait_for_fields(browser: NexaBrowser, timeout: float = FORM_TIMEOUT) -> None:
+    until = time.monotonic() + timeout
+    while time.monotonic() < until:
+        first, surname = field_state(browser, "first"), field_state(browser, "surname")
+        if first["status"] == "ambiguous" or surname["status"] == "ambiguous":
+            raise RuntimeError("Several matching name fields were found. Refusing to guess.")
+        if first["status"] == "ready" and surname["status"] == "ready":
+            print("[form] Found First name and Surname fields.", flush=True)
+            return
+        time.sleep(0.3)
+    raise TimeoutError("First name / Surname fields were not found in 45 seconds.")
+
+
+def fill_and_confirm(browser: NexaBrowser, settings: Settings, role: str, name: str) -> None:
+    state = field_state(browser, role)
+    if state.get("status") != "ready":
+        raise RuntimeError(f"{role} input missing or ambiguous immediately before fill")
+    action_wait(settings, f"Fill {role}")
+    selector = f'input[data-nexa-py-field="{role}"]'
+    browser.fill(selector, name)
+    check = field_state(browser, role)
+    if check.get("status") != "ready" or check.get("value") != name:
+        raise RuntimeError(f"{role} field did not retain the selected value; stopping")
+    print(f"[filled] {role}: {name}", flush=True)
+
+
+# ----- Date-of-birth and gender steps for authorized form testing -----
+# The screenshots do not expose the page's DOM. Support standard HTML date
+# inputs, separated day/month/year selects and inputs; reject unknown pickers
+# rather than clicking an unrelated element or silently claiming success.
+
+DATE_PROBE_JS = r"""
+(() => {
+  const tag = 'data-nexa-py-date';
+  const visible = e => {
+    const r=e.getBoundingClientRect(), st=getComputedStyle(e);
+    return r.width>0 && r.height>0 && st.visibility!=='hidden' && st.display!=='none' && !e.disabled;
+  };
+  const norm = s => String(s||'').toLowerCase().replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();
+  const meta = e => [e.name,e.id,e.getAttribute('aria-label'),e.getAttribute('placeholder'),
+    e.getAttribute('autocomplete'),e.labels && Array.from(e.labels).map(x=>x.innerText).join(' ')]
+    .map(norm).join(' ');
+  const names = { day:/(^|\s)(day|dd)(\s|$)/,month:/(^|\s)(month|mm)(\s|$)/,
+                  year:/(^|\s)(year|yyyy|yy)(\s|$)/ };
+  document.querySelectorAll('['+tag+']').forEach(e=>e.removeAttribute(tag));
+  const dates = Array.from(document.querySelectorAll('input[type="date"]')).filter(visible);
+  const dob = dates.filter(e=>/birth|dob/.test(meta(e)));
+  if (dob.length===1 || (dates.length===1 && dob.length===0)) {
+    (dob[0]||dates[0]).setAttribute(tag,'native');
+    return {kind:'native',value:(dob[0]||dates[0]).value};
+  }
+  if (dates.length>1) return {kind:'ambiguous',reason:'Multiple date inputs'};
+  for (const tagName of ['select','input']) {
+    const fields = Array.from(document.querySelectorAll(tagName)).filter(e =>
+      visible(e) && (tagName==='select' || ['text','number','tel'].includes(e.type)));
+    const picked = {};
+    for (const role of ['day','month','year']) {
+      const matches=fields.filter(e=>names[role].test(meta(e)));
+      if (matches.length===1) picked[role]=matches[0];
+      else if(matches.length>1) return {kind:'ambiguous',reason:'Multiple '+role+' fields'};
+    }
+    if(Object.keys(picked).length===3) {
+      for (const role of ['day','month','year']) picked[role].setAttribute(tag,role);
+      return {kind:tagName==='select'?'split_select':'split_input',
+        values:Object.fromEntries(Object.entries(picked).map(([k,e])=>[k,e.value]))};
+    }
+  }
+  // Unknown custom picker; never assume an element's implementation from a screenshot.
+  return {kind:'unsupported',reason:'No recognizable date input or day/month/year fields'};
+})()
+"""
+
+DATE_SELECT_JS = r"""
+(() => {
+  const d = __DAY__, m=__MONTH__, y=__YEAR__;
+  const names = {
+    day:[String(d),String(d).padStart(2,'0')],
+    month:[String(m),String(m).padStart(2,'0'),
+      new Date(Date.UTC(2000,m-1,1)).toLocaleString('en-US',{month:'long'}),
+      new Date(Date.UTC(2000,m-1,1)).toLocaleString('en-US',{month:'short'})],
+    year:[String(y)]
+  };
+  const applied = {};
+  for (const role of ['year','month','day']) {
+    const e=document.querySelector('select[data-nexa-py-date="'+role+'"]');
+    if(!e) return {error:'Missing date select: '+role};
+    const norm=s=>String(s||'').trim().toLowerCase();
+    const matching=Array.from(e.options).filter(o=>names[role].some(v=>norm(o.value)===norm(v) || norm(o.textContent)===norm(v)));
+    if(matching.length!==1) return {error:'Cannot match date option '+role, candidates:matching.length};
+    const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
+    setter.call(e,matching[0].value);
+    e.dispatchEvent(new Event('input',{bubbles:true}));
+    e.dispatchEvent(new Event('change',{bubbles:true}));
+    applied[role]=e.value;
+  }
+  return {ok:true,values:applied};
+})()
+"""
+
+DATE_VERIFY_JS = r"""
+(() => {
+  const tag='data-nexa-py-date';
+  const native=document.querySelector('input[type="date"]['+tag+'="native"]');
+  if(native)return {kind:'native',value:native.value};
+  const values={};
+  for (const role of ['day','month','year']) {
+    const el=document.querySelector('['+tag+'="'+role+'"]');
+    if (!el) return {kind:'unknown'};
+    values[role]=el.value;
+    if (el.tagName==='SELECT') {
+      values[role+'_label']=el.selectedOptions[0]?.textContent?.trim()||'';
+    }
+  }
+  return {kind:'split',values};
+})()
+"""
+
+
+
+OPEN_DOB_JS = r"""
+(() => {
+  const norm=s=>String(s||'').replace(/\s+/g,' ').toLowerCase().trim();
+  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+    return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};
+  const allowed='button,[role="button"],[aria-haspopup],input[readonly],label';
+  const matches=Array.from(document.querySelectorAll(allowed)).filter(e=>{
+    if(!visible(e))return false;
+    const label=norm(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder'));
+    return label.startsWith('date of birth') && label.length<100;
+  });
+  document.querySelectorAll('[data-nexa-py-open-dob]').forEach(e=>e.removeAttribute('data-nexa-py-open-dob'));
+  if(matches.length!==1)return {status:'unsupported',count:matches.length};
+  matches[0].setAttribute('data-nexa-py-open-dob','true');
+  return {status:'ready'};
+})()
+"""
+
+
+def wait_for_date(browser: NexaBrowser, settings: Settings, timeout: float = FORM_TIMEOUT) -> dict:
+    deadline = time.monotonic() + timeout
+    last = None
+    opened = False
+    next_open_check = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        last = browser.evaluate(DATE_PROBE_JS)
+        if isinstance(last, dict) and last.get('kind') in ('native','split_select','split_input'):
+            return last
+        if isinstance(last,dict) and last.get('kind') == 'ambiguous':
+            raise RuntimeError('Date input is ambiguous: '+str(last.get('reason')))
+        if not opened and time.monotonic() >= next_open_check:
+            button = browser.evaluate(OPEN_DOB_JS)
+            if isinstance(button,dict) and button.get('status') == 'ready':
+                action_wait(settings,'Open Date of birth picker')
+                browser.click('[data-nexa-py-open-dob="true"]')
+                opened = True
+                print('[date] Opened DOB picker; inspecting its fields.',flush=True)
+            else:
+                opened = True  # no unique safe DOB control; do not click blindly
+        time.sleep(0.3)
+    raise RuntimeError('Date picker is not a supported HTML input/select. It may be a custom picker. '
+                       'Please provide its OPEN dropdown screenshot and DOM details for an exact adapter. '
+                       'No date or Next click was attempted.')
+
+
+def set_date(browser: NexaBrowser, settings: Settings, year: int, month: int, day: int) -> None:
+    found=wait_for_date(browser,settings)
+    iso=f'{year:04d}-{month:02d}-{day:02d}'
+    print('[date] Selected test DOB:',iso,' (field type:',found['kind']+')',flush=True)
+    if found['kind']=='native':
+        action_wait(settings, 'Fill date of birth')
+        browser.fill('input[data-nexa-py-date="native"]',iso)
+        verified=browser.evaluate(DATE_VERIFY_JS)
+        if verified.get('value') != iso:
+            raise RuntimeError('Date did not retain '+iso+'; not clicking Next')
+    elif found['kind']=='split_input':
+        for role,val in [('day',day),('month',month),('year',year)]:
+            action_wait(settings,'Fill date '+role)
+            browser.fill('input[data-nexa-py-date="'+role+'"]',str(val))
+        verified=browser.evaluate(DATE_VERIFY_JS)
+        values=verified.get('values',{})
+        if any(str(values.get(k,'')).lstrip('0') != str(v) for k,v in
+               [('day',day),('month',month),('year',year)]):
+            raise RuntimeError('Date fields did not retain their values; not clicking Next')
+    else:
+        # Select fields are changed ONE at a time, with a fresh randomized action wait.
+        # Use the same option-matching logic but only change one dropdown per call.
+        for role in ('year','month','day'):
+            action_wait(settings,'Select date '+role)
+            # In a dynamic form fields may re-render; re-mark after each change.
+            latest=browser.evaluate(DATE_PROBE_JS)
+            if latest.get('kind') != 'split_select':
+                raise RuntimeError('Date dropdowns changed while filling; stopped')
+            js=DATE_SELECT_JS.replace('__DAY__',str(day)).replace('__MONTH__',str(month)).replace('__YEAR__',str(year))
+            # In this version the JS sets all three selects in a single invocation. To
+            # preserve per-action delays, use a role-specific variant.
+            js=js.replace("for (const role of ['year','month','day'])",f"for (const role of ['{role}'])")
+            result=browser.evaluate(js)
+            if not isinstance(result,dict) or result.get('ok') is not True:
+                raise RuntimeError('Could not set '+role+': '+str(result))
+        verified=browser.evaluate(DATE_VERIFY_JS)
+        if verified.get('kind') != 'split':
+            raise RuntimeError('Date dropdown validation unavailable')
+        values=verified['values']
+        # Compare the chosen option text or option value to calendar components.
+        import calendar
+        expected={
+            'day':{str(day),f'{day:02d}'},
+            'month':{str(month),f'{month:02d}',calendar.month_name[month],calendar.month_abbr[month]},
+            'year':{str(year)}
+        }
+        for role in ('day','month','year'):
+            if not ({str(values.get(role,'')),str(values.get(role+'_label',''))} & expected[role]):
+                raise RuntimeError('Date dropdown '+role+' did not retain its selected value')
+    print('[date] Fields validated.',flush=True)
+
+
+GENDER_PROBE_JS = r"""
+(() => {
+  const norm=x=>String(x||'').trim().replace(/\s+/g,' ').toLowerCase();
+  const visible=e=>{
+    const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+    return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';
+  };
+  const options={};
+  for (const role of ['female','male']) {
+    const matches=[];
+    // Prefer explicit labels (clicking these changes the radio input naturally).
+    for(const el of document.querySelectorAll('label,[role="radio"],button')) {
+      if(!visible(el) || norm(el.innerText||el.getAttribute('aria-label'))!==role)continue;
+      matches.push(el);
+    }
+    // A styled radio option may use a div with explicit aria-label.
+    if(!matches.length)for(const el of document.querySelectorAll('[aria-label]')) {
+      if(visible(el)&&norm(el.getAttribute('aria-label'))===role)matches.push(el);
+    }
+    // Narrow to one unique, visible radio control.
+    if(matches.length!==1)return {kind:'missing_or_ambiguous',role,count:matches.length};
+    options[role]=matches[0];
+  }
+  document.querySelectorAll('[data-nexa-py-gender]').forEach(e=>e.removeAttribute('data-nexa-py-gender'));
+  for(const role of ['female','male'])options[role].setAttribute('data-nexa-py-gender',role);
+  return {kind:'ready'};
+})()
+"""
+
+GENDER_VERIFY_JS = r"""
+(() => {
+  const chosen=document.querySelector('[data-nexa-py-gender="__ROLE__"]');
+  if(!chosen)return {confirmed:false,reason:'control disappeared'};
+  const associated=chosen.matches('label')&&chosen.control ? chosen.control :
+    chosen.matches('[role="radio"],input[type="radio"]')?chosen:
+    chosen.querySelector('input[type="radio"],[role="radio"]');
+  if(associated) return {confirmed:associated.checked===true||associated.getAttribute('aria-checked')==='true',
+                         source:'radio'};
+  if(chosen.getAttribute('aria-checked')!==null)
+    return {confirmed:chosen.getAttribute('aria-checked')==='true',source:'aria'};
+  return {confirmed:false,reason:'Unable to verify selection state for custom control'};
+})()
+"""
+
+
+def wait_for_gender(browser: NexaBrowser, timeout: float = FORM_TIMEOUT) -> None:
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        result=browser.evaluate(GENDER_PROBE_JS)
+        if isinstance(result,dict) and result.get('kind')=='ready':
+            print('[gender] Found Female and Male options.',flush=True)
+            return
+        time.sleep(0.3)
+    raise TimeoutError('Female/Male radio options not found. Check rendered labels/DOM.')
+
+
+def select_gender(browser: NexaBrowser, settings: Settings, gender: str) -> None:
+    wait_for_gender(browser)
+    role=gender.lower()
+    action_wait(settings,'Select '+gender)
+    browser.click(f'[data-nexa-py-gender="{role}"]')
+    result=browser.evaluate(GENDER_VERIFY_JS.replace('__ROLE__',role))
+    if not isinstance(result,dict) or result.get('confirmed') is not True:
+        raise RuntimeError('Could not confirm '+gender+' selection: '+str(result))
+    print('[gender] Selected:',gender,flush=True)
+
+
+def click_next(browser: NexaBrowser, settings: Settings, stage: str) -> None:
+    next_js=BUTTONS_JS.replace("new Set(['get started', 'find my account'])","new Set(['next'])")
+    deadline=time.monotonic()+45.0
+    while time.monotonic()<deadline:
+        found=browser.evaluate(next_js)
+        if isinstance(found,list) and 'next' in found:
+            action_wait(settings,'Next click after '+stage)
+            browser.click_text('Next')
+            print('[click] Next after '+stage,flush=True)
+            return
+        time.sleep(0.3)
+    raise TimeoutError('Next button not visible after '+stage)
+
+
+# ----- Mobile Number step: read the FIRST saved extension number (read-only) -----
+# Source confirmed against NexaBrowser v1.5.0:
+# AppStorage.Root = %LOCALAPPDATA%\FB UA Browser Lite
+# GlobalExtensionStore.NumberPath = <Root>\SharedExtensions\numbers.dpapi
+# Contents: UTF-8 lines, encrypted with DPAPI CurrentUser / no entropy.
+# The saved order is preserved and the first nonempty line is the list's top
+# entry (without applying a search filter in the extension UI).
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def _unprotect_current_user_dpapi(encrypted: bytes) -> bytes:
+    """Use Windows' own DPAPI; same Windows user who saved the numbers."""
+    if os.name != 'nt':
+        raise RuntimeError('Number extension is stored using Windows DPAPI; run on Windows.')
+    if not encrypted:
+        raise RuntimeError('Number extension file is empty.')
+    crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    unprotect = crypt32.CryptUnprotectData
+    unprotect.argtypes = [ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p,
+                          ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p,
+                          ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DATA_BLOB)]
+    unprotect.restype = wintypes.BOOL
+    free = kernel32.LocalFree
+    free.argtypes = [ctypes.c_void_p]
+    free.restype = ctypes.c_void_p
+    buffer = (ctypes.c_ubyte * len(encrypted)).from_buffer_copy(encrypted)
+    source = _DATA_BLOB(len(encrypted), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    output = _DATA_BLOB()
+    if not unprotect(ctypes.byref(source), None, None, None, None, 0,
+                     ctypes.byref(output)):
+        code = ctypes.get_last_error()
+        raise RuntimeError('Could not read Number extension using this Windows user '
+                           f'(DPAPI Windows error {code}). Use the same Windows account '
+                           'that saved the extension numbers.')
+    try:
+        return ctypes.string_at(output.pbData, output.cbData)
+    finally:
+        if output.pbData:
+            ctypes.memset(output.pbData, 0, output.cbData)
+            free(ctypes.cast(output.pbData, ctypes.c_void_p))
+
+
+def get_first_extension_number() -> str:
+    """Fetch first saved number, preserving leading 0, plus signs, and order.
+
+    Does not remove the number before confirmed successful Continue; does not copy to clipboard.
+    """
+    local = os.environ.get('LOCALAPPDATA')
+    if not local:
+        raise RuntimeError('LOCALAPPDATA is missing. Run via NexaBrowser on Windows.')
+    source = Path(local) / 'FB UA Browser Lite' / 'SharedExtensions' / 'numbers.dpapi'
+    if not source.is_file():
+        raise RuntimeError('No saved Number extension list found. Add numbers in '
+                           'NexaBrowser > Number extension first.')
+    plaintext = _unprotect_current_user_dpapi(source.read_bytes())
+    try:
+        lines = plaintext.decode('utf-8').split('\n')
+    except UnicodeDecodeError as exc:
+        raise RuntimeError('Number extension data is not valid UTF-8.') from exc
+    entries = [line.rstrip('\r') for line in lines if line.rstrip('\r')]
+    if not entries:
+        raise RuntimeError('Number extension list is empty. Add a number first.')
+    first = entries[0]
+    # An input control should only receive a telephone-like entry, not arbitrary
+    # text. We do not normalize it, because the extension preserves the original.
+    if any(char in first for char in '\r\n\t') or len(first) > 120:
+        raise RuntimeError('First Number extension entry contains invalid characters.')
+    return first
+
+
+MOBILE_FIELD_JS = r"""
+(() => {
+  const mark = 'data-nexa-py-mobile';
+  const normalize = s => String(s || '').toLowerCase().replace(/[_\-]+/g,' ').replace(/\s+/g,' ').trim();
+  const visible = e => {
+    const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+    return r.width > 0 && r.height > 0 && st.display !== 'none' &&
+      st.visibility !== 'hidden' && !e.disabled && !e.readOnly;
+  };
+  const exact = new Set(['mobile number','mobile phone','phone number','phone','tel','telephone']);
+  const matches = [];
+  for (const el of document.querySelectorAll('input')) {
+    if (!['tel','text','number'].includes((el.getAttribute('type')||'text').toLowerCase()) || !visible(el)) continue;
+    const labels = [el.getAttribute('placeholder'),el.getAttribute('aria-label'),
+      el.getAttribute('name'),el.getAttribute('id'),el.getAttribute('autocomplete')];
+    if (el.labels) for (const label of el.labels) labels.push(label.innerText||label.textContent);
+    const idref = el.getAttribute('aria-labelledby');
+    if (idref) for (const id of idref.split(/\s+/)) {
+      const t = document.getElementById(id);
+      if (t) labels.push(t.textContent);
+    }
+    if (labels.some(label => exact.has(normalize(label)))) matches.push(el);
+  }
+  document.querySelectorAll('[' + mark + ']').forEach(e=>e.removeAttribute(mark));
+  if (matches.length !== 1) return {status:matches.length ? 'ambiguous' : 'missing',count:matches.length};
+  matches[0].setAttribute(mark,'true');
+  return {status:'ready',value:matches[0].value||''};
+})()
+"""
+
+
+def mobile_field_state(browser: NexaBrowser) -> dict:
+    value = browser.evaluate(MOBILE_FIELD_JS)
+    if not isinstance(value, dict):
+        raise RuntimeError('Cannot inspect mobile number field.')
+    return value
+
+
+def fill_mobile_from_extension(browser: NexaBrowser, settings: Settings) -> str:
+    # Read only at the mobile page. Never record the complete phone number in logs.
+    state = None
+    deadline = time.monotonic() + FORM_TIMEOUT
+    while time.monotonic() < deadline:
+        state = mobile_field_state(browser)
+        if state.get('status') == 'ready':
+            break
+        if state.get('status') == 'ambiguous':
+            raise RuntimeError('Multiple mobile number inputs found; refusing to guess.')
+        time.sleep(0.3)
+    else:
+        raise TimeoutError('Mobile number input not found within 45 seconds.')
+
+    action_wait(settings, 'Read top Number extension entry')
+    number = get_first_extension_number()
+    print('[number] First saved Number extension entry loaded (value hidden).', flush=True)
+    action_wait(settings, 'Fill mobile number')
+    browser.fill('input[data-nexa-py-mobile="true"]', number)
+    result = mobile_field_state(browser)
+    if result.get('status') != 'ready' or result.get('value') != number:
+        raise RuntimeError('Mobile number was rejected or altered by the input field; Next not clicked.')
+    print('[mobile] Field filled and value checked (number hidden).', flush=True)
+    return number
+
+
+
+# ----- Password Extension text -> password page -> Save (one time only) -----
+# Source verified: GlobalExtensionStore.PasswordPath =
+# %LOCALAPPDATA%\FB UA Browser Lite\SharedExtensions\password.dpapi
+# This extension stores ONE shared UTF-8 string protected with Windows
+# DPAPI CurrentUser. Read directly under the same Windows account without
+# using the clipboard or printing plaintext in the Runner logs.
+
+def get_extension_password() -> str:
+    local = os.environ.get('LOCALAPPDATA')
+    if not local:
+        raise RuntimeError('LOCALAPPDATA is missing; run in Windows NexaBrowser.')
+    source = Path(local) / 'FB UA Browser Lite' / 'SharedExtensions' / 'password.dpapi'
+    if not source.is_file():
+        raise RuntimeError('Password extension has no saved text. Set it inside NexaBrowser first.')
+    password_bytes = _unprotect_current_user_dpapi(source.read_bytes())
+    try:
+        password = password_bytes.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise RuntimeError('Saved Password extension text is not valid UTF-8.') from exc
+    if not password:
+        raise RuntimeError('Password extension saved value is empty.')
+    if any(c in password for c in ('\r', '\n', '\x00')):
+        raise RuntimeError('Password extension value cannot be used in a single-line password field.')
+    return password
+
+
+PASSWORD_FIELD_JS = r"""
+(() => {
+  const mark = 'data-nexa-py-password';
+  const visible = el => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+      s.visibility !== 'hidden' && !el.disabled && !el.readOnly;
+  };
+  // The screenshot identifies one visible Password input. Do not guess if
+  // multiple visible password inputs appear (e.g. password + confirmation).
+  const matches = [...document.querySelectorAll('input[type="password"]')].filter(visible);
+  document.querySelectorAll('[' + mark + ']').forEach(e => e.removeAttribute(mark));
+  if (matches.length !== 1)
+    return {status:matches.length ? 'ambiguous' : 'missing', count:matches.length};
+  const field = matches[0];
+  field.setAttribute(mark, 'true');
+  return {status:'ready', value:field.value || ''};
+})()
+"""
+
+
+def password_field_state(browser: NexaBrowser) -> dict:
+    result = browser.evaluate(PASSWORD_FIELD_JS)
+    if not isinstance(result, dict):
+        raise RuntimeError('Could not inspect password field.')
+    return result
+
+
+def wait_for_password_field(browser: NexaBrowser, timeout: float = FORM_TIMEOUT) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = password_field_state(browser)
+        if result.get('status') == 'ready':
+            print('[password] Found one visible Password field.', flush=True)
+            return
+        if result.get('status') == 'ambiguous':
+            raise RuntimeError('Multiple Password fields found; refusing to guess.')
+        time.sleep(0.3)
+    raise TimeoutError('Password field not visible in 45 seconds.')
+
+
+def fill_password_from_extension(browser: NexaBrowser, settings: Settings) -> None:
+    wait_for_password_field(browser)
+    action_wait(settings, 'Read Password extension text')
+    password = get_extension_password()
+    print('[password] Saved extension text loaded securely (hidden).', flush=True)
+    action_wait(settings, 'Fill Password field')
+    browser.fill('input[type="password"][data-nexa-py-password="true"]', password)
+    check = password_field_state(browser)
+    if check.get('status') != 'ready' or check.get('value') != password:
+        raise RuntimeError('Password field did not retain the supplied value; Next not clicked.')
+    # Avoid printing the entered secret or the resulting response containing it.
+    del password
+    del check
+    print('[password] Password field filled and verified (text hidden).', flush=True)
+
+
+def click_save(browser: NexaBrowser, settings: Settings) -> None:
+    # The screenshot's confirmation page has both Save and Not now.
+    # Require this pair before clicking to avoid unrelated Save buttons.
+    probe = BUTTONS_JS.replace(
+        "new Set(['get started', 'find my account'])",
+        "new Set(['save', 'not now'])"
+    )
+    deadline = time.monotonic() + FORM_TIMEOUT
+    while time.monotonic() < deadline:
+        result = browser.evaluate(probe)
+        if isinstance(result, list) and {'save','not now'}.issubset(set(result)):
+            action_wait(settings, 'Save click')
+            browser.click_text('Save')
+            print('[click] Save clicked; waiting for next page. Website result not independently confirmed.', flush=True)
+            return
+        time.sleep(0.3)
+    raise TimeoutError('Expected Save + Not now confirmation page was not found; no click sent.')
+
+
+
+# ----- Terms acknowledgement (user-requested) and verification method -----
+# No changes to earlier stages. Require exact expected pages before taking
+# any action; do not click a similarly named control on an unrelated page.
+
+def wait_for_exact_buttons(browser: NexaBrowser, labels: tuple[str, ...], timeout: float = FORM_TIMEOUT) -> None:
+    query = BUTTONS_JS.replace(
+        "new Set(['get started', 'find my account'])",
+        'new Set(' + json.dumps([name.lower() for name in labels]) + ')',
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = browser.evaluate(query)
+        if isinstance(result, list) and set(name.lower() for name in labels).issubset(result):
+            return
+        time.sleep(0.3)
+    raise TimeoutError('Expected button(s) not found: ' + ', '.join(labels))
+
+
+def click_i_agree(browser: NexaBrowser, settings: Settings) -> None:
+    print('[terms] Waiting for I agree button...', flush=True)
+    wait_for_exact_buttons(browser, ('I agree',))
+    action_wait(settings, 'I agree click')
+    browser.click_text('I agree')
+    print('[click] I agree', flush=True)
+
+
+# Custom mobile UIs frequently draw a "radio" using an SVG/div with no actual
+# <input type=radio>. Detect the row by the exact visible label, not by input
+# presence. Click its row with WebView2's trusted CDP mouse click and verify the
+# selected state via native/ARIA state OR contrasted radio-indicator styling.
+# We NEVER click Continue if we cannot verify SMS became selected.
+SMS_RADIO_JS = r"""
+(() => {
+  const mark = 'data-nexa-py-sms-choice';
+  const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    const w = el.ownerDocument.defaultView;
+    const st = w.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && st.display !== 'none' &&
+           st.visibility !== 'hidden' && st.opacity !== '0';
+  };
+  function textOf(el) { return norm(el.innerText || el.textContent); }
+  function row(label, other) {
+    const candidates = Array.from(document.querySelectorAll('label,span,div,p,button,strong,b,section'))
+      .filter(el => visible(el) && textOf(el) === label &&
+        !Array.from(el.children).some(c => visible(c) && textOf(c) === label));
+    const roots = [];
+    for (const candidate of candidates) {
+      let current = candidate, best = candidate;
+      for (let depth = 0; depth < 11 && current; depth++, current = current.parentElement) {
+        const txt = textOf(current);
+        if (txt.includes(other) || !txt.includes(label)) break;
+        if (visible(current)) best = current;
+      }
+      if (!roots.includes(best)) roots.push(best);
+    }
+    return roots.length === 1 ? roots[0] : null;
+  }
+  function semantic(el) {
+    const nodes = [el, ...el.querySelectorAll('input[type="radio"], [role="radio"], [aria-checked], [aria-selected], [data-state]')];
+    for (const node of nodes) {
+      if (node.matches('input[type="radio"]')) return !!node.checked;
+      const v = node.getAttribute('aria-checked') || node.getAttribute('aria-selected') || node.getAttribute('data-state');
+      if (v === 'true' || v === 'checked') return true;
+      if (v === 'false' || v === 'unchecked') return false;
+    }
+    return null;
+  }
+  function isBlue(value) {
+    if (!value || value === 'none' || value === 'transparent') return false;
+    let m = String(value).match(/rgba?\(\s*(\d+)[, ]+\s*(\d+)[, ]+\s*(\d+)/i);
+    let r,g,b;
+    if (m) { [,r,g,b] = m.map(Number); }
+    else {
+      m = String(value).match(/^#([0-9a-f]{6})$/i);
+      if (!m) return false;
+      r=parseInt(m[1].slice(0,2),16); g=parseInt(m[1].slice(2,4),16); b=parseInt(m[1].slice(4,6),16);
+    }
+    return b > 130 && b > r + 55 && b > g + 35;
+  }
+  function indicatorBlue(el) {
+    // Radio indicators are typically near the trailing edge of each choice row.
+    const base = el.getBoundingClientRect(), mid = base.left + base.width * 0.55;
+    let count = 0;
+    for (const node of [el, ...el.querySelectorAll('*')]) {
+      if (!visible(node)) continue;
+      const r = node.getBoundingClientRect();
+      if (r.left + r.width/2 < mid || r.width > 70 || r.height > 70 || r.width < 5 || r.height < 5) continue;
+      const st = getComputedStyle(node);
+      const attrs = [node.getAttribute('fill'), node.getAttribute('stroke'), node.getAttribute('color')];
+      const vals = [st.borderTopColor, st.borderRightColor, st.backgroundColor, st.color, st.fill, st.stroke, ...attrs];
+      if (vals.some(isBlue)) count++;
+    }
+    return count;
+  }
+  document.querySelectorAll('[' + mark + ']').forEach(el => el.removeAttribute(mark));
+  const sms = row('send code via sms', 'send code via whatsapp');
+  const wa = row('send code via whatsapp', 'send code via sms');
+  if (!sms || !wa || sms === wa) return {status:'missing', reason:'Cannot find both exact choice rows'};
+  const smsState = semantic(sms), waState = semantic(wa);
+  let selected = null, method = 'unknown';
+  if (smsState !== null) { selected=smsState; method='semantic'; }
+  else if (waState !== null) { selected=!waState; method='opposite-semantic'; }
+  else {
+    const blueSms=indicatorBlue(sms), blueWa=indicatorBlue(wa);
+    if (blueSms > 0 && blueWa === 0) { selected=true; method='visual'; }
+    else if (blueWa > 0 && blueSms === 0) { selected=false; method='visual'; }
+  }
+  // The whole row is targeted so custom radio click handlers attached to the
+  // parent container are triggered, even when there is no radio input element.
+  sms.setAttribute(mark, 'true');
+  return {status:'ready', selected, method};
+})()
+"""
+
+
+def sms_state(browser: NexaBrowser) -> dict:
+    state = browser.evaluate(SMS_RADIO_JS)
+    if not isinstance(state, dict):
+        raise RuntimeError('Cannot inspect SMS verification option.')
+    return state
+
+
+def select_sms(browser: NexaBrowser, settings: Settings) -> None:
+    print('[verification] Looking for SMS text row (native or custom radio)...', flush=True)
+    deadline = time.monotonic() + FORM_TIMEOUT
+    while time.monotonic() < deadline:
+        state = sms_state(browser)
+        if state.get('status') == 'ready':
+            break
+        time.sleep(0.3)
+    else:
+        raise TimeoutError('SMS and WhatsApp choice rows not found within 45 seconds.')
+
+    if state.get('selected') is True:
+        print('[verification] SMS already selected and verified.', flush=True)
+        return
+    action_wait(settings, 'Select Send code via SMS')
+    browser.click('[data-nexa-py-sms-choice="true"]')
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        verified = sms_state(browser)
+        if verified.get('status') == 'ready' and verified.get('selected') is True:
+            print('[verification] SMS choice selected and verified (' + str(verified.get('method')) + ').', flush=True)
+            return
+        time.sleep(0.2)
+    raise RuntimeError('SMS choice clicked but selected state could not be verified. Continue NOT clicked.')
+
+
+AFTER_CONTINUE_JS = r"""
+(() => {
+  const text = (document.body?.innerText || '').replace(/\s+/g, ' ').toLowerCase();
+  const visible = el => !!el && el.getClientRects().length > 0 &&
+    getComputedStyle(el).visibility !== 'hidden';
+  const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+  const codeInput = inputs.some(el =>
+    /one.time.code/i.test(el.getAttribute('autocomplete') || '') ||
+    /^(otp|verification.?code|confirmation.?code|security.?code|code)$/i.test(
+      el.getAttribute('name') || el.getAttribute('id') || '') ||
+    /^(otp|verification code|confirmation code|security code|enter code)$/i.test(
+      el.getAttribute('placeholder') || ''));
+  const codeText = /enter (the |your |a )?(confirmation |verification |security |sms |text )?code|we sent (you )?(a |an )?code|confirmation code|verification code|check your (sms|texts|text messages)/.test(text);
+  const method = text.includes('send code via sms') && text.includes('send code via whatsapp');
+  const error = /something went wrong|try again later|could not send|failed to send|too many requests|temporarily blocked/.test(text);
+  return { url: location.href, method, codeInput, codeText, error };
+})()
+"""
+
+
+def click_continue_for_sms(browser: NexaBrowser, settings: Settings) -> bool:
+    # Observe transition to verification-code entry before consuming a Number.
+    state = sms_state(browser)
+    if state.get('status') != 'ready' or state.get('selected') is not True:
+        raise RuntimeError('SMS not verified as selected; Continue NOT clicked.')
+    wait_for_exact_buttons(browser, ('Continue',))
+    before = browser.evaluate(AFTER_CONTINUE_JS)
+    action_wait(settings, 'Continue click after SMS selection')
+    browser.click_text('Continue')
+    print('[click] Continue clicked. Verifying page transition...', flush=True)
+    deadline = time.monotonic() + FORM_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            result = browser.evaluate(AFTER_CONTINUE_JS)
+        except NexaAutomationError:
+            time.sleep(0.4)
+            continue
+        if isinstance(result, dict):
+            if result.get('error'):
+                raise RuntimeError('Page reported a send/verification error. Number was NOT deleted.')
+            # New OTP/code page is the strongest confirmation of success.
+            if result.get('codeInput') and not result.get('method'):
+                print('[verification] Code-entry field appeared.', flush=True)
+                return True
+            if result.get('codeText') and not result.get('method'):
+                print('[verification] Verification-code page appeared.', flush=True)
+                return True
+            # A changed URL alone is NOT proof that SMS was sent (it might be
+            # a CAPTCHA or an error page). Keep the number if evidence is weak.
+        time.sleep(0.35)
+    raise TimeoutError('Continue was clicked but code page was not confirmed. Number was NOT deleted.')
+
+
+def _protect_current_user_dpapi(plaintext: bytes) -> bytes:
+    """Encrypt data with the same Windows DPAPI CurrentUser scheme as the app."""
+    if os.name != 'nt':
+        raise RuntimeError('Number extension updates require Windows DPAPI.')
+    crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    protect = crypt32.CryptProtectData
+    protect.argtypes = [ctypes.POINTER(_DATA_BLOB), ctypes.c_wchar_p,
+                        ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p,
+                        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DATA_BLOB)]
+    protect.restype = wintypes.BOOL
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+    buf = (ctypes.c_ubyte * len(plaintext)).from_buffer_copy(plaintext)
+    source = _DATA_BLOB(len(plaintext), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
+    output = _DATA_BLOB()
+    if not protect(ctypes.byref(source), None, None, None, None, 0,
+                   ctypes.byref(output)):
+        raise RuntimeError('Could not encrypt updated Number extension data (Windows error ' +
+                           str(ctypes.get_last_error()) + ').')
+    try:
+        return ctypes.string_at(output.pbData, output.cbData)
+    finally:
+        if output.pbData:
+            ctypes.memset(output.pbData, 0, output.cbData)
+            local_free(ctypes.cast(output.pbData, ctypes.c_void_p))
+
+
+def delete_used_top_number(expected_number: str) -> None:
+    """Remove exactly one entry, only if the original top number is unchanged.
+
+    Writes ONLY an encrypted temporary file, then atomically replaces the
+    extension's encrypted file. Never writes plaintext or prints the number.
+    Close the Number Extension editor before running automation: its in-memory
+    list may overwrite an external change if the dialog remains open.
+    """
+    import tempfile
+    local = os.environ.get('LOCALAPPDATA')
+    if not local:
+        raise RuntimeError('LOCALAPPDATA not found. Number was NOT deleted.')
+    path = Path(local) / 'FB UA Browser Lite' / 'SharedExtensions' / 'numbers.dpapi'
+    if not path.is_file():
+        raise RuntimeError('Number Extension data disappeared; nothing deleted.')
+    initial_stat = path.stat()
+    raw = _unprotect_current_user_dpapi(path.read_bytes())
+    try:
+        original = raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise RuntimeError('Cannot decode Number Extension. Nothing deleted.') from exc
+    # Keep the exact ordering, original newlines and any empty lines.
+    parts = original.splitlines(keepends=True)
+    first_index = next((i for i, line in enumerate(parts) if line.rstrip('\r\n')), None)
+    if first_index is None:
+        raise RuntimeError('Number Extension list empty. Nothing deleted.')
+    if parts[first_index].rstrip('\r\n') != expected_number:
+        raise RuntimeError('Top number changed during automation; nothing deleted.')
+    new_plaintext = ''.join(parts[:first_index] + parts[first_index+1:]).encode('utf-8')
+    encrypted = _protect_current_user_dpapi(new_plaintext)
+    fd, tmp = tempfile.mkstemp(prefix='.numbers.', suffix='.tmp', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(encrypted)
+            stream.flush()
+            os.fsync(stream.fileno())
+        check = path.stat()
+        if (check.st_mtime_ns, check.st_size) != (initial_stat.st_mtime_ns, initial_stat.st_size):
+            raise RuntimeError('Number Extension changed while script was running. Nothing deleted.')
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    print('[number] Removed exactly the used top entry from Number Extension.', flush=True)
+
+def run_flow(browser: NexaBrowser, settings: Settings) -> None:
+    print('[1/16] Open URL in current NexaBrowser tab:', settings.url, flush=True)
+    browser.navigate(settings.url)
+    print('[2/16] Wait for Get Started...', flush=True)
+    wait_for_get_started(browser)
+    action_wait(settings,'Get Started click')
+    browser.click_text('Get Started')
+    print('[click] Get Started',flush=True)
+
+    print('[3/16] Wait for name fields...',flush=True)
+    wait_for_fields(browser)
+    first=random.choice(FIRST_NAMES)
+    surname=random.choice(SURNAMES)
+    fill_and_confirm(browser,settings,'first',first)
+    fill_and_confirm(browser,settings,'surname',surname)
+    if (field_state(browser,'first').get('value') != first or
+            field_state(browser,'surname').get('value') != surname):
+        raise RuntimeError('Name fields lost their values; stopped')
+    click_next(browser,settings,'name')
+
+    # Example random DOB within the exact requested bounds.
+    year=random.randint(1980,2000)
+    month=random.randint(1,12)
+    day=random.randint(1,28)
+    print('[5/16] Wait for Date of birth fields...',flush=True)
+    set_date(browser,settings,year,month,day)
+    click_next(browser,settings,'date of birth')
+
+    gender=random.choice(('Female','Male')) # 50% / 50% for independent draws
+    print('[7/16] Wait for gender radio choices...',flush=True)
+    select_gender(browser,settings,gender)
+    click_next(browser,settings,'gender')
+    print('[9/16] Wait for Mobile number field and read extension...',flush=True)
+    used_number = fill_mobile_from_extension(browser,settings)
+    click_next(browser,settings,'mobile number')
+    print('[11/16] Wait for Password input and load saved extension text...', flush=True)
+    fill_password_from_extension(browser, settings)
+    click_next(browser, settings, 'password')
+    print('[13/16] Wait for Save / Not now confirmation...', flush=True)
+    click_save(browser, settings)
+    print('[14/16] Wait for I agree...', flush=True)
+    click_i_agree(browser, settings)
+    print('[15/16] Wait for SMS verification choice...', flush=True)
+    select_sms(browser, settings)
+    print('[16/16] Click Continue...', flush=True)
+    if click_continue_for_sms(browser, settings):
+        action_wait(settings, 'Remove used Number extension entry')
+        delete_used_top_number(used_number)
+        print('[complete] Browser workflow finished; used Number entry removed.', flush=True)
+
+
+def main() -> int:
+    try:
+        assert len(FIRST_NAMES) == len(set(FIRST_NAMES)) == 50
+        assert len(SURNAMES) == len(set(SURNAMES)) == 50
+        settings = get_settings()
+        print(f"[settings] Action Time: {settings.minimum_ms}-{settings.maximum_ms} ms", flush=True)
+        browser = NexaBrowser(timeout=60)
+        run_flow(browser, settings)
+        return 0
+    except Cancelled:
+        print("[cancelled] Nothing was opened.", flush=True)
+        return 0
+    except (ValueError, RuntimeError, TimeoutError, NexaAutomationError, EOFError) as exc:
+        print(f"[error] {exc}", flush=True)
+        print("[hint] Run from NexaAura > Python Runner in the updated NexaBrowser.", flush=True)
+        return 1
+    except KeyboardInterrupt:
+        print("[stopped] User interrupted automation.", flush=True)
+        return 130
+    except Exception as exc:
+        print(f"[unexpected error] {type(exc).__name__}: {exc}", flush=True)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
